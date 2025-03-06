@@ -150,9 +150,12 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
     """
     if weight.element_size() > 1:
         return F.linear(x, weight, bias)
+    # 考虑 weight 存储的数据是 fp8 的情况
+    # 如果要求矩阵乘法的两个矩阵都是 bf16, 需要对 weight 进行 dequant
     elif gemm_impl == "bf16":
         weight = weight_dequant(weight, weight.scale)
         return F.linear(x, weight, bias)
+    # 否则对 x 做 quant 到 fp8
     else:
         x, scale = act_quant(x, block_size)
         y = fp8_gemm(x, scale, weight, weight.scale)

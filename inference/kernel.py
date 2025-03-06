@@ -36,6 +36,7 @@ def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, tor
 
     Args:
         x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
+        > x 的形状是 (bsz, seq_len, in_features)
         block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
 
     Returns:
@@ -46,6 +47,7 @@ def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, tor
     assert x.is_contiguous(), 'Input tensor must be contiguous'
     assert x.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    # s: (bsz, seq_len, in_features // block_size)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
     grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']), )
     act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
@@ -81,13 +83,17 @@ def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
     tl.store(y_ptr + offs, y, mask=mask)
 
 
+# 这个反量化的的 x 在实际使用上应该是 weight, 和上面量化的 x 不是同一个
+# 这里传入的形状是 x: (out_features, in_features), s: (out_features // block_size, in_features // block_size)
+# 而在上面的 act_quant 中传入的是 x: (bsz, seq_len, in_features)
 def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
     """
     Dequantizes the given weight tensor using the provided scale tensor.
 
     Args:
         x (torch.Tensor): The quantized weight tensor of shape (M, N).
-        s (torch.Tensor): The scale tensor of shape (M, N).
+        > kernel 没问题, 是这个 s 形状的注解导致意义不明
+        s (torch.Tensor): The scale tensor of shape (M // block_size, N // block_size).
         block_size (int, optional): The block size to use for dequantization. Defaults to 128.
 
     Returns:
