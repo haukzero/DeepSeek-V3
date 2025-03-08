@@ -115,7 +115,11 @@ class ParallelEmbedding(nn.Module):
         Raises:
             ValueError: If `world_size` is not defined.
         """
+        # ! 这里切分的是 weight 而不是 x, 每张卡分别管理把对应 vocab_id 的 token 做 embd
         if world_size > 1:
+            # 这里把不在自己的 vocab 范围内的 token 的 id 都设置为 0, 然后后面的 y 置为 0, 
+            # 所以最后需要有个 all-reduce, 也就是 0 + 0 + ... + token_weight = token_weight, 
+            # 拿到本不在自己这块卡上面处理的 token
             mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
             x = x - self.vocab_start_idx
             x[mask] = 0
@@ -303,6 +307,8 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
 
     Returns:
         torch.Tensor: Precomputed complex exponential values for positional embeddings.
+        
+        (seq_len, dim // 2), torch.complex64
     """
     dim = args.qk_rope_head_dim
     seqlen = args.max_seq_len
@@ -364,6 +370,7 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
         return ramp_func
 
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    # yarn 扩展
     if seqlen > args.original_seq_len:
         low, high = find_correction_range(beta_fast, beta_slow, dim, base, args.original_seq_len)
         smooth = 1 - linear_ramp_factor(low, high, dim // 2)
@@ -371,6 +378,7 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
 
     t = torch.arange(seqlen)
     freqs = torch.outer(t, freqs)
+    # 半径为 1 的复数
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
@@ -387,8 +395,11 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         torch.Tensor: Tensor with rotary embeddings applied.
     """
     dtype = x.dtype
+    # x: (bsz, seq_len, num_heads, dim) -> (bsz, seq_len, num_heads, dim // 2)
     x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
+    # freqs_cis: (1, seq_len, 1, head_dim // 2)
     freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+    # y: (bsz, seq_len, num_heads, dim // 2, 2) -> (bsz, seq_len, num_heads, dim)
     y = torch.view_as_real(x * freqs_cis).flatten(3)
     return y.to(dtype)
 
@@ -479,6 +490,7 @@ class MLA(nn.Module):
             scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
+            # (num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
@@ -568,11 +580,12 @@ class Gate(nn.Module):
         Forward pass for the gating mechanism.
 
         Args:
-            x (torch.Tensor): Input tensor.
+            x (torch.Tensor): Input tensor.  (bsz, seq_len, dim)
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
+        # (bsz, seq_len, n_routed_experts)
         scores = linear(x, self.weight)
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1, dtype=torch.float32)
@@ -582,6 +595,7 @@ class Gate(nn.Module):
         if self.bias is not None:
             scores = scores + self.bias
         if self.n_groups > 1:
+            # (bsz, n_groups, seq_len * n_routed_experts // n_groups)
             scores = scores.view(x.size(0), self.n_groups, -1)
             if self.bias is None:
                 group_scores = scores.amax(dim=-1)
